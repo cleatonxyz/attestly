@@ -45,14 +45,66 @@ case err != nil:                               // malformed
 
 Runnable version: `go run ./examples/basic`.
 
+## Key rotation
+
+A published record that stops verifying the moment a key is retired is
+worthless. A `KeyRing` resolves `key_id` to a public key *and* remembers when
+each key was trusted, so attestations signed while a key was active keep
+verifying forever — while anything it signs after retirement does not.
+
+```go
+ring := attestly.NewKeyRing()
+ring.AddEd25519(pub)
+ring.Retire(attestly.KeyIDFor(pub), rotationTime)
+
+err := attestly.VerifyWithRing(att, ring)   // checks key validity at IssuedAt
+```
+
+## Batch verification
+
+```go
+results, summary := attestly.VerifyBatch(atts, ring)
+fmt.Printf("%d ok, %d expired, %d forged, %d unknown key\n",
+    summary.Verified, summary.Expired, summary.BadSig, summary.UnknownKey)
+```
+
+The summary splits failures by kind on purpose: a batch that is 5% expired means
+a stale cache, one that is 5% forged means someone is attacking you. A single
+"failed" count cannot tell you which day you are having. Verification never
+stops early, so you see the whole pattern.
+
+## Verification options
+
+| Option | Effect |
+|---|---|
+| `WithClock(t)` | verify as of a fixed time |
+| `WithSkew(d)` | tolerate clock drift |
+| `AllowExpired()` | check the signature but not the window (auditing only) |
+| `ExpectSubject(s)` | reject a claim about a different subject |
+| `ExpectSchema(s)` | reject a payload shaped for someone else |
+| `MaxTTL(d)` | reject an over-long validity window |
+
+`ExpectSubject` is worth setting whenever the subject is known in advance: a
+validly signed, unexpired attestation about some *other* pool is exactly what a
+substitution attack looks like, and the signature check alone will not notice.
+
+## Other algorithms
+
+`Algorithm` + `RegisterAlgorithm` let you add secp256k1 — or anything else —
+without this package taking on the dependency. Re-registering a name panics:
+silently replacing an algorithm would let a linked-in package change what an
+existing signature means.
+
 ## CLI
 
 ```bash
 go install github.com/cleatonxyz/attestly/cmd/attestly@latest
 
-attestly keygen > key.hex          # secret to stdout, public key to stderr
-attestly verify -key <pubhex> a.json
-attestly digest -canonical a.json  # exactly what gets hashed
+attestly keygen > key.hex                 # secret to stdout, public key to stderr
+attestly sign -seed $(cat key.hex) -subject base:0xabc \
+    -schema cleaton.horizon/v1 -set horizon_days=9 -set confidence=0.70 > a.json
+attestly verify -key <pubhex> -expect-subject base:0xabc a.json
+attestly digest -canonical a.json         # exactly what gets hashed
 ```
 
 Exit status is 0 verified, 1 rejected, 2 usage error — it drops straight into a
@@ -91,7 +143,6 @@ go run ./internal/genvectors > testdata/vectors.json
 
 - secp256k1 + EIP-712 signing, so attestations verify inside an EVM contract
 - WASM build of the verifier, so a Cloudflare Worker checks the same bytes
-- key rotation helpers (multi-key resolver keyed by `key_id`)
 
 ## License
 

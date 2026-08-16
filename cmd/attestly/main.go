@@ -1,7 +1,8 @@
-// Command attestly verifies and inspects attestations from the shell.
+// Command attestly signs, verifies and inspects attestations from the shell.
 //
-//	attestly verify -key <hex> [-at <rfc3339>] [file]
-//	attestly digest [file]
+//	attestly sign -seed <hex> -subject <s> [-set k=v ...]
+//	attestly verify -key <hex> [-at <rfc3339>] [-expect-subject <s>] [file]
+//	attestly digest [-canonical] [file]
 //	attestly keygen
 //
 // Input is read from a file argument or stdin. Exit status is 0 when the
@@ -19,6 +20,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cleatonxyz/attestly"
@@ -38,6 +41,8 @@ func main() {
 	switch os.Args[1] {
 	case "verify":
 		os.Exit(cmdVerify(os.Args[2:]))
+	case "sign":
+		os.Exit(cmdSign(os.Args[2:]))
 	case "digest":
 		os.Exit(cmdDigest(os.Args[2:]))
 	case "keygen":
@@ -53,10 +58,11 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `attestly — verify signed off-chain claims
+	fmt.Fprint(os.Stderr, `attestly — sign and verify off-chain claims
 
-  attestly verify -key <hex> [-at <rfc3339>] [-allow-expired] [file]
-  attestly digest [file]
+  attestly sign -seed <hex> -subject <s> [-schema <s>] [-ttl <dur>] [-set k=v ...]
+  attestly verify -key <hex> [-at <rfc3339>] [-expect-subject <s>] [-allow-expired] [file]
+  attestly digest [-canonical] [file]
   attestly keygen
 
 Reads the attestation from [file] or stdin.
@@ -70,6 +76,8 @@ func cmdVerify(args []string) int {
 	at := fs.String("at", "", "verify as of this RFC3339 time instead of now")
 	allowExpired := fs.Bool("allow-expired", false, "check the signature but not the time bounds")
 	skew := fs.Duration("skew", 0, "tolerated clock drift, e.g. 30s")
+	expectSubject := fs.String("expect-subject", "", "reject an attestation about a different subject")
+	expectSchema := fs.String("expect-schema", "", "reject an attestation with a different schema")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -90,6 +98,12 @@ func cmdVerify(args []string) int {
 	}
 
 	opts := []attestly.VerifyOption{attestly.WithSkew(*skew)}
+	if *expectSubject != "" {
+		opts = append(opts, attestly.ExpectSubject(*expectSubject))
+	}
+	if *expectSchema != "" {
+		opts = append(opts, attestly.ExpectSchema(*expectSchema))
+	}
 	if *allowExpired {
 		opts = append(opts, attestly.AllowExpired())
 	}
@@ -116,6 +130,90 @@ func cmdVerify(args []string) int {
 	}
 	fmt.Printf("OK subject=%s schema=%s expires=%s\n",
 		att.Claim.Subject, att.Claim.Schema, att.Claim.ExpiresAt.UTC().Format(time.RFC3339))
+	return exitOK
+}
+
+// kvFlag collects repeated -set key=value pairs into a payload.
+type kvFlag map[string]any
+
+func (k kvFlag) String() string { return fmt.Sprintf("%v", map[string]any(k)) }
+
+func (k kvFlag) Set(s string) error {
+	i := strings.IndexByte(s, '=')
+	if i <= 0 {
+		return fmt.Errorf("want key=value, got %q", s)
+	}
+	key, val := s[:i], s[i+1:]
+	// Integers become integers; everything else stays a string. Floats are
+	// deliberately not parsed — the canonical encoding rejects them, and a
+	// decimal that silently became a float would fail at signing time with a
+	// confusing error instead of here.
+	if n, err := strconv.ParseInt(val, 10, 64); err == nil {
+		k[key] = n
+	} else {
+		k[key] = val
+	}
+	return nil
+}
+
+func cmdSign(args []string) int {
+	fs := flag.NewFlagSet("sign", flag.ContinueOnError)
+	seedHex := fs.String("seed", "", "ed25519 private key seed, hex encoded (required)")
+	subject := fs.String("subject", "", "what the claim is about (required)")
+	schema := fs.String("schema", "", "payload schema identifier")
+	ttl := fs.Duration("ttl", 24*time.Hour, "how long the attestation stays valid")
+	issuedAt := fs.String("at", "", "issue time as RFC3339, defaults to now")
+	nonce := fs.String("nonce", "", "optional nonce")
+	payload := kvFlag{}
+	fs.Var(payload, "set", "payload entry key=value, repeatable")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	if *seedHex == "" || *subject == "" {
+		fmt.Fprintln(os.Stderr, "attestly: -seed and -subject are required")
+		return exitUsage
+	}
+	seed, err := hex.DecodeString(*seedHex)
+	if err != nil || len(seed) != ed25519.SeedSize {
+		fmt.Fprintf(os.Stderr, "attestly: -seed must be %d hex-encoded bytes\n", ed25519.SeedSize)
+		return exitUsage
+	}
+	priv := ed25519.NewKeyFromSeed(seed)
+	pub := priv.Public().(ed25519.PublicKey)
+
+	issued := time.Now().UTC()
+	if *issuedAt != "" {
+		issued, err = time.Parse(time.RFC3339, *issuedAt)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "attestly: -at must be RFC3339:", err)
+			return exitUsage
+		}
+	}
+
+	claim := attestly.Claim{
+		Subject:   *subject,
+		Schema:    *schema,
+		IssuedAt:  issued,
+		ExpiresAt: issued.Add(*ttl),
+		Nonce:     *nonce,
+	}
+	if len(payload) > 0 {
+		claim.Payload = payload
+	}
+
+	att, err := attestly.Sign(priv, attestly.KeyIDFor(pub), claim)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "attestly:", err)
+		return exitFail
+	}
+	// Public key to stderr so `> att.json` captures only the attestation.
+	fmt.Fprintf(os.Stderr, "public %s\nkey_id %s\n", hex.EncodeToString(pub), attestly.KeyIDFor(pub))
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(att); err != nil {
+		fmt.Fprintln(os.Stderr, "attestly:", err)
+		return exitFail
+	}
 	return exitOK
 }
 
